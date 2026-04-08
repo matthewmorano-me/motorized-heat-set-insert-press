@@ -12,7 +12,7 @@ pin_DIR  = Pin(1, Pin.OUT, value=1)  # HIGH=forward(up), LOW=reverse(down)
 limit_top = Pin(2, Pin.IN, pull=Pin.PULL_UP)   # GP2: triggered when at top
 limit_bot = Pin(3, Pin.IN, pull=Pin.PULL_UP)   # GP3: triggered when at bottom
 
-STEP_DELAY_US = 65  # lower = faster
+STEP_DELAY_US = 200  # lower = faster
 DIR_SETUP_US  = 20   # DIR must be stable before pulsing (TB6600 requirement)
 
 def step_once():
