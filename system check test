@@ -1,0 +1,180 @@
+'''
+System check for motorized heat-set insert press.
+  - Cycles stepper motor between limit switches continuously
+  - Core 1 continuously reads HX711 load cell into a buffer (non-blocking)
+  - Buffer is flushed to CSV and SGP40 VOC is sampled at each top/bottom pause
+  - Turns on DC fan via transistor
+
+GPIO assignments are based on System Wiring Diagram 09APR2026.pdf
+Note that the subsystem test scripts used placeholder pins for isolated testing.
+'''
+
+from machine import Pin, I2C
+from hx711_pio import HX711
+from bme280 import SGP40
+import time
+import _thread
+
+# ---------------------------------------------------------------------------
+# Pin assignments — VERIFY against System Wiring Diagram 09APR2026.pdf
+# ---------------------------------------------------------------------------
+PIN_STEP   = 0    # TB6600 PUL-  (common-anode setup; idle HIGH, pulse LOW to step)
+PIN_DIR    = 1    # TB6600 DIR-  (HIGH = forward/up, LOW = reverse/down)
+
+PIN_HX_DT  = 10  # HX711 data
+PIN_HX_SCK = 11  # HX711 clock
+
+PIN_FAN    = 15   # Fan transistor base via 1 kΩ resistor (HIGH = fan on)
+
+PIN_TOP    = 16    # SW1_NC top limit switch    (NC, PULL_UP; reads 1 when triggered)
+PIN_BOT    = 17    # SW2_NC bottom limit switch (NC, PULL_UP; reads 1 when triggered)
+
+I2C_ID     = 1    # SGP40 uses I2C1
+PIN_SCL    = 27   # SGP40 SCL
+PIN_SDA    = 26   # SGP40 SDA
+
+# ---------------------------------------------------------------------------
+# Timing / behaviour
+# ---------------------------------------------------------------------------
+STEP_DELAY_US = 200   # µs between steps (lower = faster)
+DIR_SETUP_US  = 20    # µs DIR must be stable before step pulse (TB6600 requirement)
+LOG_FILE      = 'system_check_log.csv'
+
+# ---------------------------------------------------------------------------
+# Hardware init
+# ---------------------------------------------------------------------------
+pin_step = Pin(PIN_STEP, Pin.OUT, value=1)   # idle HIGH
+pin_dir  = Pin(PIN_DIR,  Pin.OUT, value=1)
+
+lim_top  = Pin(PIN_TOP,  Pin.IN, pull=Pin.PULL_UP)
+lim_bot  = Pin(PIN_BOT,  Pin.IN, pull=Pin.PULL_UP)
+
+fan      = Pin(PIN_FAN,  Pin.OUT, value=0)
+
+pin_sck = Pin(PIN_HX_SCK, Pin.OUT)
+pin_dt  = Pin(PIN_HX_DT,  Pin.IN, pull=Pin.PULL_DOWN)
+hx = HX711(pin_sck, pin_dt, gain=128, state_machine=0)
+
+i2c = I2C(I2C_ID, scl=Pin(PIN_SCL), sda=Pin(PIN_SDA), freq=40000)
+voc = SGP40(i2c, 0x59)
+
+# ---------------------------------------------------------------------------
+# HX711 startup and tare
+# ---------------------------------------------------------------------------
+hx.power_down()
+time.sleep_ms(100)
+hx.power_up()
+time.sleep_ms(500) # power cycle for clean startup
+
+print("Taring load cell (15 readings)...")
+hx.tare(times=15)
+raw_tare = hx.read()
+print("Tare done.")
+
+# ---------------------------------------------------------------------------
+# Fan on
+# ---------------------------------------------------------------------------
+fan.value(1)
+print("Fan on.")
+
+# ---------------------------------------------------------------------------
+# CSV header
+# ---------------------------------------------------------------------------
+with open(LOG_FILE, 'w') as f:
+    f.write('time_ms,force_N,voc_raw\n') # add header to columns in CSV log file
+print(f"Logging to {LOG_FILE}")
+
+# ---------------------------------------------------------------------------
+# Core 1 — continuous HX711 reader
+# ---------------------------------------------------------------------------
+# latest_force: most-recent tared force reading (N), available to core 0 for
+#               closed-loop control without any blocking wait
+latest_force = 0.0
+_buf_lock    = _thread.allocate_lock()
+_log_buf     = []   # list of (t_ms, force_N) accumulated between flushes
+_hx_running  = True
+
+def _hx_reader():
+    # Runs on core 1. Reads HX711 as fast as it produces samples (~10 SPS at
+    # gain=128) and appends each reading to _log_buf.
+    global latest_force
+    while _hx_running:
+        val = hx.read()
+        t   = time.ticks_diff(time.ticks_ms(), t0)
+        force = (val - raw_tare) / 1000
+        latest_force = force
+        with _buf_lock:
+            _log_buf.append((t, force))
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def step_once():
+    # Pulse PUL- LOW for 10 µs then back HIGH. TB6600 steps on the falling edge
+    pin_step.low()
+    time.sleep_us(10)
+    pin_step.high()
+    time.sleep_us(STEP_DELAY_US) # delay before next step, change STEP_DELAY_US to adjust speed
+
+def flush_log():
+    # Drain _log_buf to CSV and take one VOC reading while the motor is stopped
+    global _log_buf
+    voc_raw = voc.measure_raw()
+    with _buf_lock:
+        rows = _log_buf
+        _log_buf = []
+    with open(LOG_FILE, 'a') as f:
+        for t, force in rows:
+            f.write(f'{t},{force:.2f},{voc_raw}\n')
+    print(f"force={latest_force:.2f}N")
+    print(f"VOC={voc_raw}")
+    if rows:
+        print(f"({len(rows)} rows flushed)")
+
+def move_to_top():
+    # Drive forward until the top limit switch is triggered
+    global step_count
+    print("Moving to top...")
+    pin_dir.value(1)
+    time.sleep_us(DIR_SETUP_US)
+    while lim_top.value() == 0:   # 0 = NC closed (not triggered); keep stepping
+        step_once()
+        step_count += 1
+    print("Top reached.")
+
+def move_to_bottom():
+    # Drive reverse until the bottom limit switch is triggered
+    global step_count
+    print("Moving to bottom...")
+    pin_dir.value(0)
+    time.sleep_us(DIR_SETUP_US)
+    while lim_bot.value() == 0:   # 0 = NC closed (not triggered); keep stepping
+        step_once()
+        step_count += 1
+    print("Bottom reached.")
+
+# ---------------------------------------------------------------------------
+# Main cycle
+# ---------------------------------------------------------------------------
+step_count = 0
+t0 = time.ticks_ms()
+
+_thread.start_new_thread(_hx_reader, ())   # core 1: continuous force sampling
+print("Starting stepper cycle — Ctrl+C to stop.")
+
+try:
+    while True:
+        move_to_top()
+        flush_log()           # flush force buffer + VOC while stationary at top
+        time.sleep_ms(300)    # brief pause at top before reversing
+        move_to_bottom()
+        flush_log()           # flush force buffer + VOC while stationary at bottom
+        time.sleep_ms(300)    # brief pause at bottom before reversing
+
+# Ctrl+C to cleanly shut down fan and HX711
+except KeyboardInterrupt:
+    _hx_running = False    # signal core 1 to stop
+    time.sleep_ms(200)     # let the reader thread exit
+    fan.value(0)           # cut power to fan
+    hx.power_down()        # put HX711 into low-power sleep
+    print(f"\nStopped. {step_count} steps total. Fan off. Log: {LOG_FILE}")

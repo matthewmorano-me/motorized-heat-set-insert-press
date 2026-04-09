@@ -1,3 +1,5 @@
+# This script tests the TB6600 stepper driver by allowing manual control of the motor using buttons. It also serves as a basic system check to confirm that the motor, driver, and wiring are functional before running the full insert cycle.
+#
 from machine import Pin
 import time
 

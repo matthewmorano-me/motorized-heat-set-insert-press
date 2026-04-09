@@ -1,11 +1,13 @@
+# Test script to confirm load cell is functional
 # HX711 load cell amplifier test script for Raspberry Pi Pico (MicroPython)
+
 from hx711_pio import HX711
 from machine import Pin
 import time
 
 # Configure data and clock pins for HX711
-pin_DT  = Pin(0, Pin.IN, pull=Pin.PULL_DOWN)   # Data pin (GP0, input with pull-down)
-pin_SCK = Pin(1, Pin.OUT)                        # Clock pin (GP1, output)
+pin_DT  = Pin(10, Pin.IN, pull=Pin.PULL_DOWN)   # Data pin (GP0, input with pull-down)
+pin_SCK = Pin(11, Pin.OUT)                        # Clock pin (GP1, output)
 
 # Initialize HX711 with 128x gain on channel A, using PIO state machine 0
 hx = HX711(pin_SCK, pin_DT, gain=128, state_machine=0)

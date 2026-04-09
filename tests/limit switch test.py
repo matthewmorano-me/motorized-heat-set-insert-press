@@ -1,3 +1,6 @@
+# Limit switch test script for Raspberry Pi Pico (MicroPython)
+# This script tests the functionality of the limit switches by driving the motor until each switch is triggered
+
 from machine import Pin
 import time
 
@@ -9,8 +12,8 @@ pin_DIR  = Pin(1, Pin.OUT, value=1)  # HIGH=forward(up), LOW=reverse(down)
 
 # Limit switches — NC wired to GND (open = triggered, PULL_UP otherwise)
 # Adjust GP numbers to match your wiring
-limit_top = Pin(2, Pin.IN, pull=Pin.PULL_UP)   # GP2: triggered when at top
-limit_bot = Pin(3, Pin.IN, pull=Pin.PULL_UP)   # GP3: triggered when at bottom
+limit_top = Pin(16, Pin.IN, pull=Pin.PULL_UP)   # GP2: triggered when at top
+limit_bot = Pin(17, Pin.IN, pull=Pin.PULL_UP)   # GP3: triggered when at bottom
 
 STEP_DELAY_US = 200  # lower = faster
 DIR_SETUP_US  = 20   # DIR must be stable before pulsing (TB6600 requirement)
