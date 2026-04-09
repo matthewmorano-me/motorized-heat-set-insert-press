@@ -8,6 +8,6 @@ air_quality = SGP40(i2c, 0x59)
 while True:
   Air_quality = air_quality.measure_raw()
   print("Air quality = ",Air_quality)
-  sleep(0.1)
+  sleep(1)
   
   
