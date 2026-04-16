@@ -1,0 +1,187 @@
+'''
+Follow-me test for motorized heat-set insert press.
+  - Push DOWN on the load cell  -> stage moves DOWN
+  - Pull / push UP on the load cell -> stage moves UP
+  - |force| controls speed (bigger force = faster)
+  - Limit switches halt motion before the next command
+  - HX711 is read blockingly in the main loop (~10 Hz at gain=128)
+  - Each force sample is logged to CSV
+
+Stepper motion is handled by the SmartStepper library (PIO + DMA).
+Install on the Pico first:
+    mpremote mip install github:bikeNomad/micropython-rp2-smartStepper
+
+GPIO per System Wiring Diagram 09APR2026.pdf.
+'''
+
+from machine import Pin
+from hx711_pio import HX711
+from smartstepper import SmartStepper
+import time
+
+# ---------------------------------------------------------------------------
+# Pin assignments
+# ---------------------------------------------------------------------------
+PIN_STEP   = 0    # TB6600 PUL-  (common anode)
+PIN_DIR    = 1    # TB6600 DIR-
+
+PIN_HX_DT  = 10
+PIN_HX_SCK = 11
+
+PIN_TOP    = 16   # top limit switch    (NC, PULL_UP; 1 when triggered)
+PIN_BOT    = 17   # bottom limit switch (NC, PULL_UP; 1 when triggered)
+
+# ---------------------------------------------------------------------------
+# Mechanical constants
+# ---------------------------------------------------------------------------
+LEADSCREW_PITCH_MM  = 5.0
+MOTOR_STEPS_PER_REV = 200
+MICROSTEPS          = 8          # VERIFY against TB6600 DIP switches
+STEPS_PER_MM = int(MOTOR_STEPS_PER_REV * MICROSTEPS / LEADSCREW_PITCH_MM)   # 320
+
+# Flip these if "direction='down'" actually moves the stage up (DIR wiring).
+DIR_DOWN_STR = 'down'
+DIR_UP_STR   = 'up'
+
+# ---------------------------------------------------------------------------
+# Follow-me tuning  (speeds in mm/s, force in load-cell units)
+# ---------------------------------------------------------------------------
+FORCE_SIGN       = +1            # flip if pushing down moves the stage up
+
+FORCE_DEADBAND   = 0.05          # below this magnitude: no motion
+FORCE_FULLSPEED  = 2.0           # maps to MAX_SPEED_MMPS
+
+MIN_SPEED_MMPS   = 0.3           # slowest meaningful follow speed
+MAX_SPEED_MMPS   = 5.0           # fastest follow speed
+ACCEL_MMPS2      = 30.0          # soft start/stop on direction changes
+
+STATUS_PERIOD_MS = 200
+RAIL_GUARD       = 100
+LOG_FILE         = 'follow_me_log.csv'
+
+# ---------------------------------------------------------------------------
+# Hardware init
+# ---------------------------------------------------------------------------
+lim_top  = Pin(PIN_TOP,  Pin.IN, pull=Pin.PULL_UP)
+lim_bot  = Pin(PIN_BOT,  Pin.IN, pull=Pin.PULL_UP)
+
+pin_sck  = Pin(PIN_HX_SCK, Pin.OUT)
+pin_dt   = Pin(PIN_HX_DT,  Pin.IN, pull=Pin.PULL_DOWN)
+hx = HX711(pin_sck, pin_dt, gain=128, state_machine=0)
+
+stepper = SmartStepper(
+    stepPin=PIN_STEP,
+    dirPin=PIN_DIR,
+    accelCurve='smooth2',
+)
+stepper.stepsPerUnit = STEPS_PER_MM
+stepper.minSpeed     = MIN_SPEED_MMPS
+stepper.maxSpeed     = MAX_SPEED_MMPS
+stepper.acceleration = ACCEL_MMPS2
+
+# ---------------------------------------------------------------------------
+# HX711 startup and tare
+# ---------------------------------------------------------------------------
+hx.power_down()
+time.sleep_ms(100)
+hx.power_up()
+time.sleep_ms(500)
+
+print("Taring load cell (keep it unloaded)...")
+hx.tare(times=15)
+raw_tare = hx.read()
+print("Tare done.")
+
+# ---------------------------------------------------------------------------
+# CSV
+# ---------------------------------------------------------------------------
+log_f = open(LOG_FILE, 'w')
+log_f.write('time_ms,force_N\n')
+log_f.flush()
+print(f"Logging to {LOG_FILE}")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def force_to_speed(mag):
+    if mag <= FORCE_DEADBAND:
+        return None
+    if mag >= FORCE_FULLSPEED:
+        return MAX_SPEED_MMPS
+    ratio = (mag - FORCE_DEADBAND) / (FORCE_FULLSPEED - FORCE_DEADBAND)
+    return MIN_SPEED_MMPS + ratio * (MAX_SPEED_MMPS - MIN_SPEED_MMPS)
+
+def read_force():
+    # Blocks ~100 ms per sample. Rejects rail-pinned glitch readings.
+    while True:
+        val = hx.read()
+        if val >=  8388607 - RAIL_GUARD:  continue
+        if val <= -8388608 + RAIL_GUARD:  continue
+        return FORCE_SIGN * (val - raw_tare) / 1000
+
+# ---------------------------------------------------------------------------
+# Main follow-me loop
+# ---------------------------------------------------------------------------
+t0 = time.ticks_ms()
+print("Follow-me running. Push the load cell to move the stage. Ctrl+C to stop.\n")
+
+cur_dir     = None   # DIR_DOWN_STR, DIR_UP_STR, or None (stopped)
+cur_speed   = None
+last_status = time.ticks_ms()
+
+try:
+    while True:
+        f = read_force()
+        t = time.ticks_diff(time.ticks_ms(), t0)
+        log_f.write(f'{t},{f:.2f}\n')
+
+        mag = f if f >= 0 else -f
+        want_dir = DIR_DOWN_STR if f > 0 else DIR_UP_STR
+
+        blocked = (
+            (want_dir == DIR_UP_STR   and lim_top.value() == 1) or
+            (want_dir == DIR_DOWN_STR and lim_bot.value() == 1)
+        )
+
+        speed = None if blocked else force_to_speed(mag)
+
+        if speed is None:
+            if cur_speed is not None:
+                stepper.stop(emergency=True)
+                stepper.waitEndOfMove()
+                cur_dir   = None
+                cur_speed = None
+        else:
+            if want_dir != cur_dir:
+                if cur_dir is not None:
+                    stepper.stop(emergency=True)
+                    stepper.waitEndOfMove()
+                stepper.jog(maxSpeed=speed, direction=want_dir)
+                cur_dir   = want_dir
+                cur_speed = speed
+            elif speed != cur_speed:
+                # Same direction, new target speed — library ramps smoothly.
+                stepper.maxSpeed = speed
+                cur_speed = speed
+
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_status) >= STATUS_PERIOD_MS:
+            last_status = now
+            dir_str = "--" if cur_dir is None else ("UP" if cur_dir == DIR_UP_STR else "DN")
+            s_str   = "----" if cur_speed is None else f"{cur_speed:4.1f}"
+            t_hit   = "T" if lim_top.value() == 1 else "."
+            b_hit   = "B" if lim_bot.value() == 1 else "."
+            print(f"force={f:+6.2f}N  dir={dir_str}  speed={s_str} mm/s  limits=[{t_hit}{b_hit}]")
+            log_f.flush()
+
+except KeyboardInterrupt:
+    try:
+        stepper.stop(emergency=True)
+        stepper.waitEndOfMove()
+        stepper.disable()
+    except Exception:
+        pass
+    log_f.flush()
+    log_f.close()
+    hx.power_down()
+    print(f"\nStopped. Log: {LOG_FILE}")
