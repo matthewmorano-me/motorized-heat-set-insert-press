@@ -1,6 +1,6 @@
 '''
 System check for motorized heat-set insert press.
-  - Cycles stepper motor between limit switches continuously
+  - Stepper pulses are generated in hardware by a PIO state machine (core 0 free)
   - Core 1 continuously reads HX711 load cell into a buffer (non-blocking)
   - Buffer is flushed to CSV and SGP40 VOC is sampled at each top/bottom pause
   - Turns on DC fan via transistor
@@ -14,6 +14,7 @@ from hx711_pio import HX711
 from bme280 import SGP40
 import time
 import _thread
+import rp2
 
 # ---------------------------------------------------------------------------
 # Pin assignments — VERIFY against System Wiring Diagram 09APR2026.pdf
@@ -43,7 +44,7 @@ LOG_FILE      = 'system_check_log.csv'
 # ---------------------------------------------------------------------------
 # Hardware init
 # ---------------------------------------------------------------------------
-pin_step = Pin(PIN_STEP, Pin.OUT, value=1)   # idle HIGH
+pin_step = Pin(PIN_STEP, Pin.OUT, value=1)   # idle HIGH (PIO drives this once started)
 pin_dir  = Pin(PIN_DIR,  Pin.OUT, value=1)
 
 lim_top  = Pin(PIN_TOP,  Pin.IN, pull=Pin.PULL_UP)
@@ -107,15 +108,45 @@ def _hx_reader():
             _log_buf.append((t, force))
 
 # ---------------------------------------------------------------------------
+# PIO stepper pulse generator
+# ---------------------------------------------------------------------------
+# Runs on a dedicated state machine on PIO1 (HX711 library owns state_machine=0
+# on PIO0). Generates a continuous stream of STEP pulses at a CPU-configurable
+# rate, completely independent of core 0 / core 1 activity.
+@rp2.asm_pio(set_init=rp2.PIO.OUT_HIGH)
+def _step_pulse_prog():
+    pull()                    # blocking pull: read delay count (µs) from TX FIFO
+    mov(x, osr)               # x = delay count (constant for the run)
+    wrap_target()
+    set(pins, 0)       [9]    # PUL- LOW for 10 PIO cycles (10 µs pulse width)
+    set(pins, 1)              # PUL- HIGH (idle)
+    mov(y, x)                 # y = delay counter
+    label("delay")
+    jmp(y_dec, "delay")       # spin y→0 (1 µs per cycle at 1 MHz PIO clock)
+    wrap()
+
+_STEP_PIO_FREQ = 1_000_000   # 1 MHz => 1 PIO cycle = 1 µs
+stepper_sm = rp2.StateMachine(
+    4,                         # state machine 4 = PIO1 sm0 (HX711 uses PIO0)
+    _step_pulse_prog,
+    freq=_STEP_PIO_FREQ,
+    set_base=pin_step,
+)
+
+def start_stepper(delay_us=STEP_DELAY_US):
+    # Restart clears FIFO + scratch, push the delay, then activate
+    stepper_sm.active(0)
+    stepper_sm.restart()
+    stepper_sm.put(delay_us)
+    stepper_sm.active(1)
+
+def stop_stepper():
+    stepper_sm.active(0)
+    pin_step.value(1)          # leave PUL- idle HIGH
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def step_once():
-    # Pulse PUL- LOW for 10 µs then back HIGH. TB6600 steps on the falling edge
-    pin_step.low()
-    time.sleep_us(10)
-    pin_step.high()
-    time.sleep_us(STEP_DELAY_US) # delay before next step, change STEP_DELAY_US to adjust speed
-
 def flush_log():
     # Drain _log_buf to CSV and take one VOC reading while the motor is stopped
     global _log_buf
@@ -132,25 +163,26 @@ def flush_log():
         print(f"({len(rows)} rows flushed)")
 
 def move_to_top():
-    # Drive forward until the top limit switch is triggered
-    global step_count
+    # PIO generates step pulses; core 0 just watches the limit switch and the
+    # current latest_force reading (ready for closed-loop control)
     print("Moving to top...")
     pin_dir.value(1)
     time.sleep_us(DIR_SETUP_US)
+    start_stepper(STEP_DELAY_US)
     while lim_top.value() == 0:   # 0 = NC closed (not triggered); keep stepping
-        step_once()
-        step_count += 1
+        pass                      # core 0 free for control logic / force checks
+    stop_stepper()
     print("Top reached.")
 
 def move_to_bottom():
-    # Drive reverse until the bottom limit switch is triggered
-    global step_count
+    # PIO generates step pulses; core 0 just watches the limit switch
     print("Moving to bottom...")
     pin_dir.value(0)
     time.sleep_us(DIR_SETUP_US)
+    start_stepper(STEP_DELAY_US)
     while lim_bot.value() == 0:   # 0 = NC closed (not triggered); keep stepping
-        step_once()
-        step_count += 1
+        pass
+    stop_stepper()
     print("Bottom reached.")
 
 # ---------------------------------------------------------------------------
