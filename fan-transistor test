@@ -1,0 +1,17 @@
+from machine import Pin
+import time
+
+# Define the fan pin
+fan_pin = Pin(15, Pin.OUT)
+
+# Turn the fan on
+try:
+    while True:
+        fan_pin.on()
+        time.sleep(3)  # Run for 5 seconds
+        fan_pin.off()  # Turn the fan off
+        time.sleep(3)  # Wait for 5 seconds before turning it on again
+
+except KeyboardInterrupt:
+    print("Fan test stopped.")
+    fan_pin.off()  # Ensure the fan is turned off when stopping the test
