@@ -15,13 +15,17 @@ pin_DIR  = Pin(1, Pin.OUT, value=1)  # DIR-: HIGH=forward, LOW=reverse
 btn_fwd = Pin(20, Pin.IN, pull=Pin.PULL_UP)  # GP20: step forward
 btn_rev = Pin(21, Pin.IN, pull=Pin.PULL_UP)  # GP21: step reverse
 
+# Limit switches (NC, pull-up; value()==1 when triggered)
+lim_top = Pin(16, Pin.IN, pull=Pin.PULL_UP)  # GP16: blocks forward (UP)
+lim_bot = Pin(17, Pin.IN, pull=Pin.PULL_UP)  # GP17: blocks reverse (DOWN)
+
 STEP_DELAY_US = 100  # Adjust for speed; lower = faster
 DIR_SETUP_US  = 20   # TB6600 needs DIR stable before step pulse
 
-print("Running - GP20=forward, GP21=reverse")
+print("Running - GP20=UP, GP21=DOWN")
 
 while True:
-    if btn_fwd.value() == 0:
+    if btn_fwd.value() == 0 and lim_top.value() == 0:
         pin_DIR.value(1)
         time.sleep_us(DIR_SETUP_US)  # let DIR settle before pulsing
         pin_STEP.low()
@@ -29,7 +33,7 @@ while True:
         pin_STEP.high()
         time.sleep_us(STEP_DELAY_US)
 
-    elif btn_rev.value() == 0:
+    elif btn_rev.value() == 0 and lim_bot.value() == 0:
         pin_DIR.value(0)
         time.sleep_us(DIR_SETUP_US)  # let DIR settle before pulsing
         pin_STEP.low()
