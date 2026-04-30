@@ -20,6 +20,8 @@ boundaries; force samples go straight to CSV.
 Safety:
   - Bottom limit switch is polled on every force sample during descent
   - Ctrl+C at any phase cleans up and retracts
+  - GP13 (LM393 photoresistor) LOW pauses cycle and parks at top until HIGH,
+    then resumes from the start of the cycle (does not exit the program)
 
 Stepper is driven by machine.Timer. HX711 owns PIO0 SM0.
 GPIO per System Wiring Diagram 09APR2026.pdf.
@@ -34,6 +36,7 @@ from hx711_pio import HX711
 # ---------------------------------------------------------------------------
 PIN_STEP, PIN_DIR     = 0, 1
 PIN_HX_DT, PIN_HX_SCK = 10, 11
+PIN_PHOT              = 13         # LM393 photoresistor digital out; LOW = abort
 PIN_TOP, PIN_BOT      = 16, 17
 PIN_START_BTN         = 20
 
@@ -84,6 +87,7 @@ dir_pin   = Pin(PIN_DIR,  Pin.OUT, value=DIR_UP)
 lim_top   = Pin(PIN_TOP,  Pin.IN, pull=Pin.PULL_UP)
 lim_bot   = Pin(PIN_BOT,  Pin.IN, pull=Pin.PULL_UP)
 start_btn = Pin(PIN_START_BTN, Pin.IN, pull=Pin.PULL_UP)
+phot      = Pin(PIN_PHOT, Pin.IN)         # LM393 module drives the line
 
 hx = HX711(Pin(PIN_HX_SCK, Pin.OUT),
            Pin(PIN_HX_DT,  Pin.IN, pull=Pin.PULL_DOWN),
@@ -125,6 +129,15 @@ def stop_stepper():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+class PhotAbort(Exception):
+    pass
+
+def check_phot():
+    # Raise PhotAbort if GP13 (LM393 photoresistor) is LOW. Polled in motion
+    # loops; main handles the exception by retracting and holding at top.
+    if phot.value() == 0:
+        raise PhotAbort
+
 def read_force():
     while True:
         val = hx.read()
@@ -176,6 +189,7 @@ def press_cycle(t0):
         while True:
             if lim_bot.value() == 1:
                 return
+            check_phot()
 
             f = read_force()
             t = time.ticks_diff(time.ticks_ms(), t0)
@@ -190,6 +204,7 @@ def press_cycle(t0):
                 while time.ticks_diff(time.ticks_ms(), dwell_deadline) < 0:
                     if lim_bot.value() == 1:
                         return
+                    check_phot()
                     f = read_force()
                     t = time.ticks_diff(time.ticks_ms(), t0)
                     log_f.write(f'{t},0.000,{f:.2f}\n')
@@ -219,26 +234,42 @@ print(f"Logging to {LOG_FILE}")
 t0 = time.ticks_ms()
 
 try:
-    print("Homing to top...")
-    home_to_top()
+    while True:
+        try:
+            print("Homing to top...")
+            home_to_top()
 
-    print(f"Positioning {HOME_OFFSET_MM} mm below top...")
-    move_mm(HOME_OFFSET_MM, POSITION_SPEED_MMPS, DIR_DOWN)
+            print(f"Positioning {HOME_OFFSET_MM} mm below top...")
+            move_mm(HOME_OFFSET_MM, POSITION_SPEED_MMPS, DIR_DOWN)
 
-    print("\nReady. Press GP20 to begin cycle (Ctrl+C to abort).")
-    while start_btn.value() == 1:
-        time.sleep_ms(20)
-    while start_btn.value() == 0:
-        time.sleep_ms(20)
-    time.sleep_ms(100)
+            print("\nReady. Press GP20 to begin cycle (Ctrl+C to exit, GP13 low to pause).")
+            while start_btn.value() == 1:
+                check_phot()
+                time.sleep_ms(20)
+            while start_btn.value() == 0:
+                check_phot()
+                time.sleep_ms(20)
+            time.sleep_ms(100)
 
-    press_cycle(t0)
+            press_cycle(t0)
 
-    print("Retracting to top...")
-    home_to_top()
+            print("Retracting to top...")
+            home_to_top()
 
-    print("\nDone.")
-    print(f"Copy log to PC:  mpremote fs cp :{LOG_FILE} .")
+            print("\nDone.")
+            print(f"Copy log to PC:  mpremote fs cp :{LOG_FILE} .")
+            break
+
+        except PhotAbort:
+            print("\nGP13 low. Retracting and holding... Insert part to resume.")
+            try:
+                stop_stepper()
+                home_to_top()
+            except Exception as e:
+                print(f"Retract failed: {e}")
+            while phot.value() == 0:
+                time.sleep_ms(100)
+            print("GP13 high. Resuming.")
 
 except KeyboardInterrupt:
     print("\nInterrupted. Retracting...")
