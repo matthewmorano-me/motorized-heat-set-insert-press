@@ -34,28 +34,28 @@ from hx711_pio import HX711
 # ---------------------------------------------------------------------------
 # Pins
 # ---------------------------------------------------------------------------
-PIN_STEP, PIN_DIR     = 0, 1
-PIN_HX_DT, PIN_HX_SCK = 10, 11
+PIN_STEP, PIN_DIR     = 0, 1       # Stepper pins
+PIN_HX_DT, PIN_HX_SCK = 10, 11     # Load Cell HX711 pins
 PIN_PHOT              = 13         # LM393 photoresistor digital out; LOW = abort
-PIN_TOP, PIN_BOT      = 16, 17
-PIN_START_BTN         = 20
+PIN_FAN               = 15         # Fan control pin (active HIGH via transistor)
+PIN_TOP, PIN_BOT      = 16, 17     # Limit Switches
+PIN_START_BTN         = 20         # Start button for press cycle on MakerPi board
 
-# ---------------------------------------------------------------------------
-# Mechanical: 200 steps/rev * 8 microsteps / 5 mm pitch = 320 steps/mm
-# ---------------------------------------------------------------------------
-STEPS_PER_MM = 200 * 8 // 5       # VERIFY microstep count against TB6600 DIPs
+
+STEPS_PER_MM = 200 * 8 // 5        # 200 steps/rev * 8 microsteps / 5 mm pitch = 320 steps/mm
+   
 
 # ---------------------------------------------------------------------------
 # Motion tuning (mm and mm/s)
 # ---------------------------------------------------------------------------
 HOME_OFFSET_MM      = 5.0
-DESCENT_DISTANCE_MM = 3.2       # distance advanced past contact (seating depth)
+DESCENT_DISTANCE_MM = 3.2          # distance advanced past contact (seating depth)
 
 HOMING_FAST_MMPS    = 8.0
 HOMING_SLOW_MMPS    = 1.0
 HOMING_BACKOFF_MM   = 2.0
 POSITION_SPEED_MMPS = 4.0
-APPROACH_SPEED_MMPS = 2.0         # pre-contact descent through air
+APPROACH_SPEED_MMPS = 2.0          # pre-contact descent through air
 SEATING_SPEED_MMPS  = 0.25         # post-contact seating push
 
 CONTACT_FORCE_THRESHOLD = 10.0     # tared scaled-force units (raw_counts / 1000).
@@ -88,6 +88,7 @@ lim_top   = Pin(PIN_TOP,  Pin.IN, pull=Pin.PULL_UP)
 lim_bot   = Pin(PIN_BOT,  Pin.IN, pull=Pin.PULL_UP)
 start_btn = Pin(PIN_START_BTN, Pin.IN, pull=Pin.PULL_UP)
 phot      = Pin(PIN_PHOT, Pin.IN)         # LM393 module drives the line
+fan_pin   = Pin(PIN_FAN, Pin.OUT, value=0)
 
 hx = HX711(Pin(PIN_HX_SCK, Pin.OUT),
            Pin(PIN_HX_DT,  Pin.IN, pull=Pin.PULL_DOWN),
@@ -179,6 +180,7 @@ def press_cycle(t0):
     global _step_count
     _step_count = 0
 
+    fan_pin.on()
     dir_pin.value(DIR_DOWN); time.sleep_us(5)
     start_stepper(APPROACH_SPEED_MMPS)
 
@@ -224,6 +226,7 @@ def press_cycle(t0):
                 return
     finally:
         stop_stepper()
+        fan_pin.off()
 
 # ---------------------------------------------------------------------------
 # Main
