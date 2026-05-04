@@ -236,6 +236,17 @@ def home_to_top():
     time.sleep_ms(100)
     _run_until_top(HOMING_SLOW_MMPS, HOMING_TIMEOUT_MS)
 
+def log_row(t, disp, f):
+    '''
+    Append one CSV row to the open log_f handle: time_ms, displacement_mm
+    (3 decimals), force (2 decimals). Called from inside press_cycle's
+    polling loop, so it must stay allocation-light — the f-string is the
+    only allowed cost. No flush() here: flushing mid-cycle would jitter
+    the Timer ISR, so the buffer is held until cleanup in the outer
+    finally block. Header row is written separately at startup.
+    '''
+    log_f.write(f'{t},{disp:.3f},{f:.2f}\n')
+
 # ---------------------------------------------------------------------------
 # Descent: approach until contact, dwell, then seat DESCENT_DISTANCE_MM.
 # No prints inside the polling loops — they jitter the Timer ISR.
@@ -296,14 +307,14 @@ def press_cycle(t0):
                     check_phot()
                     f = read_force()
                     t = time.ticks_diff(time.ticks_ms(), t0)
-                    log_f.write(f'{t},0.000,{f:.2f}\n')
+                    log_row(t, 0.0, f)
                 print(f"Seating at {SEATING_SPEED_MMPS} mm/s")
                 dir_pin.value(DIR_DOWN); time.sleep_us(5)
                 start_stepper(SEATING_SPEED_MMPS)
 
             if steps_at_contact is not None:
                 disp = (_step_count - steps_at_contact) / STEPS_PER_MM
-                log_f.write(f'{t},{disp:.3f},{f:.2f}\n')
+                log_row(t, disp, f)
 
             if (steps_at_contact is not None and stop_at_step is not None
                     and _step_count >= stop_at_step):
