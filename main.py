@@ -48,13 +48,12 @@ STEPS_PER_MM = 200 * 8 // 5        # 200 steps/rev * 8 microsteps / 5 mm pitch =
 # ---------------------------------------------------------------------------
 # Motion tuning (mm and mm/s)
 # ---------------------------------------------------------------------------
-HOME_OFFSET_MM      = 5.0
-DESCENT_DISTANCE_MM = 3.2          # distance advanced past contact (seating depth)
+HOME_OFFSET_MM      = 5.0          # "Home" offset below top limit for standby before press cycle
+DESCENT_DISTANCE_MM = 3.0          # Press displacement. Set equal to insert length
+HOMING_BACKOFF_MM   = 2.0          # backoff distance after fast homing to clear the switch for slow homing
 
-HOMING_FAST_MMPS    = 8.0
-HOMING_SLOW_MMPS    = 1.0
-HOMING_BACKOFF_MM   = 2.0
-POSITION_SPEED_MMPS = 4.0
+HOMING_FAST_MMPS    = 8.0          # fast approach to top limit
+HOMING_SLOW_MMPS    = 1.0          # slow approach for final homing after backoff
 APPROACH_SPEED_MMPS = 2.0          # pre-contact descent through air
 SEATING_SPEED_MMPS  = 0.25         # post-contact seating push
 
@@ -108,6 +107,14 @@ _step_state = 0
 _step_count = 0
 
 def _step_cb(_t):
+    '''
+    Timer ISR fired at 2x the desired step rate. Each call toggles the STEP
+    line, so a full HIGH->LOW->HIGH cycle (one step) takes two firings. We
+    count only on rising edges so _step_count tracks delivered steps and can
+    be converted to mm via STEPS_PER_MM. Keep this callback tiny: it runs on
+    the Timer ISR and any allocation or print() will jitter the pulse train
+    and corrupt the displacement log during the press cycle.
+    '''
     global _step_state, _step_count
     _step_state ^= 1
     step_pin.value(_step_state)
@@ -115,10 +122,26 @@ def _step_cb(_t):
         _step_count += 1
 
 def start_stepper(mmps):
+    '''
+    Start continuous stepping at `mmps` linear speed. Converts mm/s to a
+    Timer frequency (2 ISR firings per step, STEPS_PER_MM steps per mm) and
+    arms the periodic Timer with _step_cb. Caller is responsible for setting
+    DIR_PIN before calling and for stopping the Timer with stop_stepper()
+    once the move is finished. Re-calling start_stepper() reinitializes the
+    Timer at the new frequency without an explicit stop in between.
+    '''
     freq_hz = int(2 * mmps * STEPS_PER_MM)
     step_tmr.init(freq=freq_hz, mode=Timer.PERIODIC, callback=_step_cb)
 
 def stop_stepper():
+    '''
+    Stop the periodic Timer driving STEP and drive the STEP line LOW so the
+    driver isn't left holding a partial pulse. The try/except guards against
+    deinit() raising when the Timer was never armed (e.g. early Ctrl+C in
+    main, or the finally block of press_cycle running after a PhotAbort).
+    _step_count is intentionally NOT reset here — callers that need a fresh
+    step origin (e.g. press_cycle latching contact) zero it themselves.
+    '''
     global _step_state
     try:
         step_tmr.deinit()
@@ -134,12 +157,28 @@ class PhotAbort(Exception):
     pass
 
 def check_phot():
-    # Raise PhotAbort if GP13 (LM393 photoresistor) is LOW. Polled in motion
-    # loops; main handles the exception by retracting and holding at top.
+    '''
+    Raise PhotAbort if GP13 (LM393 photoresistor) reads LOW, indicating the
+    safety cover/light barrier has been broken. Polled inside every motion
+    loop (homing, approach, dwell, seating) so we can interrupt mid-move.
+    The exception unwinds back to main, which retracts to the top limit and
+    holds there until the line goes HIGH again, then restarts the cycle.
+    Cheaper than wiring an IRQ — a single GPIO read at the polling cadence
+    is plenty fast given the millisecond-scale loops in this program.
+    '''
     if phot.value() == 0:
         raise PhotAbort
 
 def read_force():
+    '''
+    Read one tared, scaled force sample from the HX711. The 24-bit ADC
+    returns signed values in [-8388608, +8388607]; samples within RAIL_GUARD
+    counts of either rail are treated as saturated/invalid and rejected by
+    looping until a clean reading arrives. The rail guard catches the
+    transient garbage the HX711 emits during gain switches and after
+    power_up(). Output is (raw - raw_tare) / 1000, the same scaled units
+    used by CONTACT_FORCE_THRESHOLD; not calibrated to newtons or grams.
+    '''
     while True:
         val = hx.read()
         if val >=  8388607 - RAIL_GUARD:  continue
@@ -147,12 +186,30 @@ def read_force():
         return (val - raw_tare) / 1000
 
 def move_mm(distance_mm, speed_mmps, direction):
+    '''
+    Open-loop timed move: set DIR, start the stepper at `speed_mmps`, sleep
+    for distance/speed seconds, then stop. Used wherever we need a fixed
+    relative move with no contact/limit checking — the HOME_OFFSET descent
+    after homing and the backoff between fast and slow homing passes. The
+    5 us delay after dir_pin.value() satisfies the DRV8825/TB6600 setup-
+    time spec before the first STEP edge. Because this blocks on time.sleep,
+    PhotAbort cannot interrupt the move; only use it for short distances.
+    '''
     dir_pin.value(direction); time.sleep_us(5)
     start_stepper(speed_mmps)
     time.sleep(distance_mm / speed_mmps)
     stop_stepper()
 
 def _run_until_top(mmps, timeout_ms):
+    '''
+    Drive UP at `mmps` until the top limit switch reads active (1), polling
+    in a tight loop. If `timeout_ms` elapses before the switch trips, stop
+    the motor and raise RuntimeError so the caller can react instead of the
+    crosshead grinding into the rail forever (failed switch, broken wire,
+    blocked carriage, wrong direction wiring). Single-pass primitive used
+    twice by home_to_top: once fast for coarse approach, once slow after
+    backoff for a repeatable final position.
+    '''
     dir_pin.value(DIR_UP); time.sleep_us(5)
     start_stepper(mmps)
     deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
@@ -163,6 +220,16 @@ def _run_until_top(mmps, timeout_ms):
     stop_stepper()
 
 def home_to_top():
+    '''
+    Two-stage homing routine for repeatable top-of-travel positioning.
+    First runs UP fast (HOMING_FAST_MMPS) to bring the crosshead near the
+    switch quickly, then backs off HOMING_BACKOFF_MM at slow speed to clear
+    the switch with margin, then re-approaches at HOMING_SLOW_MMPS so the
+    final trip happens at low velocity. Slow re-approach removes the speed-
+    dependent overshoot you get from a single fast hit and gives a
+    consistent zero across runs. The 100 ms pauses let the carriage settle
+    so the slow re-approach starts from rest.
+    '''
     _run_until_top(HOMING_FAST_MMPS, HOMING_TIMEOUT_MS)
     time.sleep_ms(100)
     move_mm(HOMING_BACKOFF_MM, HOMING_SLOW_MMPS, DIR_DOWN)
@@ -174,13 +241,33 @@ def home_to_top():
 # No prints inside the polling loops — they jitter the Timer ISR.
 # ---------------------------------------------------------------------------
 def press_cycle(t0):
+    '''
+    Full descent: approach -> contact detection -> heat-soak dwell -> seat.
+
+    Steps DOWN at APPROACH_SPEED_MMPS while polling the
+    bottom limit, photoresistor, and load cell. On the first force sample
+    that exceeds CONTACT_FORCE_THRESHOLD we latch _step_count as the
+    displacement origin, stop the motor, and dwell HEAT_SOAK_DWELL_MS so
+    the heated tip can melt the surrounding plastic before any further
+    motion. During the dwell we keep logging force at zero displacement so
+    the soak phase is visible in the CSV. After the dwell we restart the
+    stepper at the slower SEATING_SPEED_MMPS and continue down until the
+    delivered step count reaches stop_at_step (= contact + DESCENT_DISTANCE
+    in steps, scaled by DISP_CAL for empirical lead-screw calibration).
+
+    Timing reference t0 is passed in from main so all log timestamps share
+    a single origin across cycles. Print() is restricted to phase
+    boundaries (contact, seating, completion) — printing inside the polling
+    loop perturbs the Timer ISR enough to corrupt the displacement record.
+    The finally block guarantees the stepper is off on any exit path:
+    normal completion, bottom-limit trip, PhotAbort, or KeyboardInterrupt.
+    '''
     print(f"Approaching at {APPROACH_SPEED_MMPS} mm/s. Waiting for contact "
           f"(threshold={CONTACT_FORCE_THRESHOLD}). Ctrl+C or bottom limit to stop.")
 
     global _step_count
     _step_count = 0
 
-    fan_pin.on()
     dir_pin.value(DIR_DOWN); time.sleep_us(5)
     start_stepper(APPROACH_SPEED_MMPS)
 
@@ -226,7 +313,6 @@ def press_cycle(t0):
                 return
     finally:
         stop_stepper()
-        fan_pin.off()
 
 # ---------------------------------------------------------------------------
 # Main
@@ -234,6 +320,8 @@ def press_cycle(t0):
 log_f = open(LOG_FILE, 'w')
 log_f.write('time_ms,displacement_mm,force\n')
 print(f"Logging to {LOG_FILE}")
+print(f"Limit switches at startup: top={lim_top.value()} bot={lim_bot.value()} (expect both 0 when not pressed)")
+fan_pin.on()
 t0 = time.ticks_ms()
 
 try:
@@ -243,7 +331,7 @@ try:
             home_to_top()
 
             print(f"Positioning {HOME_OFFSET_MM} mm below top...")
-            move_mm(HOME_OFFSET_MM, POSITION_SPEED_MMPS, DIR_DOWN)
+            move_mm(HOME_OFFSET_MM, HOMING_SLOW_MMPS, DIR_DOWN)
 
             print("\nReady. Press GP20 to begin cycle (Ctrl+C to exit, GP13 low to pause).")
             while start_btn.value() == 1:
@@ -285,6 +373,7 @@ except KeyboardInterrupt:
 
 finally:
     stop_stepper()
+    fan_pin.off()
     try:
         log_f.flush(); log_f.close()
     except Exception: pass
