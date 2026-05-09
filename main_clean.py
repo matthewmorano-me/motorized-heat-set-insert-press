@@ -1,6 +1,14 @@
 '''
 ME106 Project: Motorized heat-set insert press
 
+Main Components:
+- Raspberry Pi Pico microcontroller
+- Stepper motor with TB6600 driver for vertical motion
+- Fan for cooling stepper driver 
+- HX711 load cell amplifier for force measurement   
+- LM393 photoresistor sensor to detect part presence and abort if no part is detected
+- Two limit switches for homing and safety (top and bottom)
+
 Program flow:
   1. Home crosshead to top limit
   2. Descend HOME_OFFSET_MM to stage above the insert
